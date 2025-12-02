@@ -8,7 +8,7 @@ Python 版本需求 (>=3.8)」或「建議使用虛擬環境」
 安裝必要套件：
 pip install -r requirements.txt
 或
-pip install yfinance pandas matplotlib numpy
+pip install yfinance pandas matplotlib numpy streamlit
 執行：
 python multi.py
 進行輸入時保持輸入法為英文輸入法/半形文字
