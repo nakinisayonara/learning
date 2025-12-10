@@ -54,7 +54,7 @@ if "edit_shares" not in st.session_state:
 col1, col2, col3 = st.columns([2, 2, 1])
 
 with col1:
-    new_symbol = st.text_input("股票代號（不含後綴，例如 2330 或 AAPL）")
+    new_symbol = st.text_input("股票代號")
 
 with col2:
     region = st.radio("選擇市場", [
