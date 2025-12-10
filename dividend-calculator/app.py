@@ -82,12 +82,28 @@ def annual_dividend_income_hkd(ticker: str, dividends_series: pd.Series, shares:
 
 # Streamlit 介面
 
+# 初始化股票清單
+if "symbols" not in st.session_state:
+    st.session_state.symbols = []
+
 st.set_page_config(page_title="多市場股息分析工具(HKD)", page_icon="💹", layout="wide")
 st.title("多市場股息分析工具（港幣換算版）")
 
 with st.sidebar:
     st.markdown("### 設定")
-    tickers = st.text_input("股票代號（逗號分隔）", "2330.TW, 0005.HK, AAPL")
+    new_symbol = st.text_input("輸入股票代號（例如 2330.TW, AAPL）")
+
+    if st.button("+ 添加"):
+        if new_symbol.strip():
+            st.session_state.symbols.append(new_symbol.strip().upper())
+            st.success(f"已添加：{new_symbol.strip().upper()}")
+
+    if st.session_state.symbols:
+        st.write("已添加股票：", st.session_state.symbols)
+        if st.button("清空清單"):
+            st.session_state.symbols = []
+            st.info("股票清單已清空")
+
     shares = st.number_input("持股數量（每檔同一數量）", min_value=1, value=100)
     # checkbox 勾選
     show_trend = st.checkbox("顯示近 36 個月股息趨勢（本幣）", value=True)
@@ -95,9 +111,9 @@ with st.sidebar:
     interval_months = st.selectbox("X 軸刻度（月間隔）", options=[1, 3, 6, 12, 24], index=1)
     run = st.button("開始分析")
 
-if run and tickers:
+if run and st.session_state.symbols:
     # 拆分代號, 去空白
-    tickers_list = [t.strip() for t in tickers.split(",") if t.strip()]
+    tickers_list = st.session_state.symbols
     # {} dict 以字典資料類型收集結果
     results = {}
     st.markdown("### 分析結果")
