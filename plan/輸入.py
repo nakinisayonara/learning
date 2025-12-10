@@ -6,6 +6,62 @@ import csv
 import json
 from datetime import datetime
 import html
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+import shutil
+# 可選：若要檔案鎖避免多視窗衝突，安裝 filelock 並啟用
+from filelock import FileLock
+
+# ---------- 本機儲存路徑與工具函式 ----------
+APP_DIR = Path.home() / ".my_stock_app"   # 可改為你想要的資料夾名稱
+APP_DIR.mkdir(parents=True, exist_ok=True)
+LOCAL_PORTFOLIO_PATH = APP_DIR / "portfolio.json"
+BACKUP_DIR = APP_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+# 可選：檔案鎖（避免多視窗同時寫入）
+# LOCK_PATH = str(LOCAL_PORTFOLIO_PATH) + ".lock"
+
+def load_local_portfolio():
+    """
+    從本機讀取 portfolio.json，若不存在或解析失敗回傳空 list。
+    插入位置：在 session_state 初始化前呼叫以載入初始資料。
+    """
+    try:
+        if LOCAL_PORTFOLIO_PATH.exists():
+            text = LOCAL_PORTFOLIO_PATH.read_text(encoding="utf-8")
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
+    except Exception:
+        # 可在此加入 logging
+        pass
+    return []
+
+# 啟用檔案鎖路徑
+LOCK_PATH = str(LOCAL_PORTFOLIO_PATH) + ".lock"
+
+def save_local_portfolio(portfolio):
+    """
+    使用 FileLock 與原子寫入，回傳 True/False
+    若鎖被占用會等待最多 5 秒，超時則回傳 False
+    """
+    try:
+        lock = FileLock(LOCK_PATH, timeout=5)
+        with lock:
+            if LOCAL_PORTFOLIO_PATH.exists():
+                backup_name = BACKUP_DIR / f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                shutil.copy2(LOCAL_PORTFOLIO_PATH, backup_name)
+            with NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(APP_DIR)) as tf:
+                json.dump(portfolio, tf, ensure_ascii=False, indent=2)
+                temp_name = tf.name
+            shutil.move(temp_name, str(LOCAL_PORTFOLIO_PATH))
+        return True
+    except Exception as e:
+        # 可選：在開發時印出例外到 logs
+        # st.error(f"儲存發生例外: {e}")
+        return False
+
 
 def safe_rerun():
     try:
@@ -32,17 +88,23 @@ CREATE TABLE IF NOT EXISTS portfolio (
 conn.commit()
 
 # 啟動時從資料庫載入到 session_state
+# ---------- session_state 初始化（替換或插入） ----------
 if "portfolio" not in st.session_state:
-    st.session_state.portfolio = []
-    c.execute("SELECT id, symbol, shares, region FROM portfolio ORDER BY id")
-    rows = c.fetchall()
-    for r in rows:
-        st.session_state.portfolio.append({
-            "id": r[0],
-            "symbol": r[1],
-            "shares": r[2],
-            "region": r[3]
-        })
+    # 優先使用本機檔案（若存在且非空），否則從 SQLite 載入
+    local = load_local_portfolio()
+    if local:
+        st.session_state.portfolio = local
+    else:
+        st.session_state.portfolio = []
+        c.execute("SELECT id, symbol, shares, region FROM portfolio ORDER BY id")
+        rows = c.fetchall()
+        for r in rows:
+            st.session_state.portfolio.append({
+                "id": r[0],
+                "symbol": r[1],
+                "shares": r[2],
+                "region": r[3]
+            })
 
 # 用來記錄目前正在編輯的項目 id 與暫存編輯值
 if "edit_id" not in st.session_state:
@@ -101,7 +163,6 @@ def add_item():
     suffix = suffix_map.get(region, "")
     full_symbol = symbol_raw.upper() + suffix
 
-    # 重複檢查
     exists = any(item["symbol"] == full_symbol for item in st.session_state.portfolio)
     if exists:
         st.warning(f"{full_symbol} 已在清單中，若要更新持股請先刪除再重新加入")
@@ -120,7 +181,16 @@ def add_item():
         "shares": int(new_shares),
         "region": region
     })
-    st.success(f"已添加：{full_symbol}，持股 {new_shares} 股")
+
+    # 儲存到本機並回饋；成功後再重新整理畫面
+    ok = save_local_portfolio(st.session_state.portfolio)
+    if ok:
+        st.success(f"已添加：{full_symbol}，持股 {new_shares} 股；並已儲存到本機")
+        safe_rerun()
+    else:
+        # 已寫入 SQLite，但本機儲存失敗，明確提示使用者後續處理
+        st.warning(f"已添加：{full_symbol}，持股 {new_shares} 股（已寫入資料庫）。")
+        st.error("儲存到本機失敗，請檢查檔案權限或磁碟空間；若需要可重新嘗試匯出或手動備份。")
 
 if st.button("+ 新增到清單"):
     add_item()
@@ -168,7 +238,7 @@ if st.session_state.portfolio:
     display_rows = []
     for p in st.session_state.portfolio:
         display_rows.append({
-            "編號": p["id"],
+            # "編號": p["id"],
             "代號": p["symbol"],
             "持股數": p["shares"],
             "市場": p["region"]
@@ -192,7 +262,15 @@ if st.session_state.portfolio:
             if st.button("刪除", key=f"del_{item['id']}"):
                 c.execute("DELETE FROM portfolio WHERE id = ?", (item["id"],))
                 conn.commit()
+                # 更新session_state
                 st.session_state.portfolio = [p for p in st.session_state.portfolio if p["id"] != item["id"]]
+
+                ok = save_local_portfolio(st.session_state.portfolio)
+                if ok:
+                    st.success("已刪除並儲存到本機")
+                else:
+                    st.error("刪除成功但儲存到本機失敗，請檢查檔案權限或磁碟空間")
+
                 safe_rerun()
         with col_d:
             st.write("")
@@ -218,10 +296,18 @@ if st.session_state.portfolio:
                         if p["id"] == edit_item["id"]:
                             p["shares"] = int(new_value)
                             break
+
+                    ok = save_local_portfolio(st.session_state.portfolio)
                     st.session_state.edit_id = None
                     st.session_state.edit_shares = 0
-                    st.success("已更新持股數")
+                    if ok:
+                        st.success("已更新持股數並儲存到本機")
+                    else:
+                        st.success("已更新持股數")
+                        st.error("但儲存到本機失敗，請檢查檔案權限或磁碟空間")
+
                     safe_rerun()
+
             with col_cancel:
                 if st.button("取消", key=f"cancel_{edit_item['id']}"):
                     st.session_state.edit_id = None
@@ -322,7 +408,15 @@ def import_csv_with_mode(uploaded_file, mode="skip"):
                 st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                 added += 1
 
+                # 匯入完成後，儲存到本機檔案（一次儲存）
+        try:
+            save_local_portfolio(st.session_state.portfolio)
+        except Exception:
+            # 若 save_local_portfolio 已處理錯誤並回傳 False，可在此額外處理
+            pass
+
         return added, updated, skipped
+
     except Exception:
         st.error("匯入 CSV 發生錯誤")
         return 0, 0, 0
@@ -408,7 +502,15 @@ def import_json_with_mode(uploaded_file, mode="skip"):
                 st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                 added += 1
 
+        # 匯入完成後，儲存到本機檔案（一次儲存）
+        try:
+            save_local_portfolio(st.session_state.portfolio)
+        except Exception:
+            # 若 save_local_portfolio 已處理錯誤並回傳 False，可在此額外處理
+            pass
+
         return added, updated, skipped
+
     except json.JSONDecodeError:
         st.error("JSON 解析錯誤：請確認檔案為有效的 JSON 格式（陣列）。")
         return 0, 0, 0
@@ -592,5 +694,11 @@ if st.button("清空全部"):
         c.execute("DELETE FROM portfolio")
         conn.commit()
         st.session_state.portfolio = []
-        st.info("股票清單已清空")
+
+        ok = save_local_portfolio(st.session_state.portfolio)
+        if ok:
+            st.info("股票清單已清空並儲存到本機")
+        else:
+            st.info("股票清單已清空")
+            st.error("但儲存到本機失敗，請檢查檔案權限")
         safe_rerun()

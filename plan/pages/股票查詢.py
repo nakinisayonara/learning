@@ -16,6 +16,14 @@ import pandas as pd
 from datetime import datetime
 import altair as alt
 import matplotlib.pyplot as plt
+import os
+import time
+import requests
+import math
+
+
+# 讀取備援 API key（若使用 Alpha Vantage 或其他）
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 
 # -------------------------
 # 頁面設定
@@ -52,25 +60,72 @@ def read_query_queue():
 @st.cache_data(ttl=60)
 def fetch_price(symbol: str):
     """
-    使用 yfinance 抓取單檔價格與前收。
-    回傳 dict: {"price": float or None, "previous": float or None}
-    若抓取失敗，price 為 None。
+    主來源 yfinance，失敗時依序備援 Alpha Vantage。
+    回傳統一格式 dict:
+      {"price": float or None, "previous": float or None, "name": str or None, "source": str}
     ttl=60 秒快取，避免短時間內重複請求。
     """
+    def normalize(price, prev, name, source):
+        return {"price": price, "previous": prev, "name": name, "source": source}
+
+    # 1) 嘗試 yfinance（含 history fallback）
     try:
         t = yf.Ticker(symbol)
         info = t.info or {}
         price = info.get("regularMarketPrice") or info.get("currentPrice")
         prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-        # 若 info 沒有價格，使用 history 做 fallback
+        name = info.get("shortName") or info.get("longName")
         if price is None:
             hist = t.history(period="2d")
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
                 prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
-        return {"price": price, "previous": prev}
+        if price is not None:
+            return normalize(price, prev, name, "yfinance")
     except Exception:
-        return {"price": None, "previous": None}
+        pass
+
+    # 2) 重試 yfinance 幾次（短暫退避）
+    for attempt in range(2):
+        try:
+            time.sleep(0.5 * (2 ** attempt))
+            t = yf.Ticker(symbol)
+            info = t.info or {}
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+            name = info.get("shortName") or info.get("longName")
+            if price is None:
+                hist = t.history(period="2d")
+                if not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+                    prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+            if price is not None:
+                return normalize(price, prev, name, "yfinance_retry")
+        except Exception:
+            continue
+
+    # 3) 備援來源：Alpha Vantage (GLOBAL_QUOTE)（需設定 ALPHA_VANTAGE_KEY）
+    if ALPHA_VANTAGE_KEY:
+        try:
+            url = "https://www.alphavantage.co/query"
+            params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY}
+            r = requests.get(url, params=params, timeout=8)
+            data = r.json()
+            # 若被限流或回傳錯誤，檢查 Note / Error Message
+            if isinstance(data, dict) and ("Note" in data or "Error Message" in data):
+                return normalize(None, None, None, "alpha_vantage_rate_limited")
+            q = data.get("Global Quote", {}) if isinstance(data, dict) else {}
+            price_str = q.get("05. price") or q.get("05. Price")
+            price = float(price_str) if price_str else None
+            prev = None
+            name = None
+            if price is not None:
+                return normalize(price, prev, name, "alpha_vantage")
+        except Exception:
+            pass
+
+    # 4) 若所有來源皆失敗，回傳 None
+    return normalize(None, None, None, "none")
 
 # -------------------------
 # 主流程：讀取 queue 並逐檔查詢
@@ -81,31 +136,81 @@ if not queue:
     st.info("查詢隊列為空。請在主頁（app.py）按「將整個清單送去股票查詢」後再回到此頁。")
 else:
     st.markdown(f"**查詢時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}**")
-    results = []
-    total_value_all = 0.0   # 全部市場總市值
-    missing = []
 
-    # 逐檔查詢並計算持有市值
-    for item in queue:
-        symbol = item.get("symbol")
-        shares = item.get("shares") or 0
-        region = item.get("region") or "未知"   # 若沒有 region，標為 "未知"
-        price_info = fetch_price(symbol)
-        price = price_info.get("price")
-        if price is None:
-            missing.append(symbol)
-            market_value = None
-        else:
-            market_value = price * shares
-            total_value_all += market_value
+    # 建議把查詢主體包在 spinner 中，並嘗試先用批次抓價再 fallback
+    with st.spinner("正在查詢價格，請稍候..."):
+        results = []
+        total_value_all = 0.0
+        missing = []
 
-        results.append({
-            "symbol": symbol,
-            "shares": shares,
-            "price": price,
-            "market_value": market_value,
-            "region": region
-        })
+        # 1) 先嘗試批次抓價（分批下載以降低記憶體與限流風險）
+        symbols = [item["symbol"] for item in queue]
+
+        def batch_download_prices(symbols, batch_size=40):
+            """
+            分批使用 yf.download 取得當日價格，回傳 dict: {symbol: price or None}
+            處理多檔與單檔回傳格式差異，若失敗則該 symbol 對應 None
+            """
+            results_map = {}
+            for i in range(0, len(symbols), batch_size):
+                chunk = symbols[i:i+batch_size]
+                try:
+                    hist = yf.download(tickers=" ".join(chunk), period="1d", group_by="ticker", threads=True, progress=False)
+                except Exception:
+                    hist = None
+                for sym in chunk:
+                    price = None
+                    if hist is not None:
+                        try:
+                            # 多檔回傳時為 MultiIndex：hist[sym]["Close"]
+                            if isinstance(hist.columns, pd.MultiIndex):
+                                price = float(hist[sym]["Close"].iloc[-1])
+                            else:
+                                # 單檔回傳時：hist["Close"]
+                                price = float(hist["Close"].iloc[-1])
+                        except Exception:
+                            price = None
+                    results_map[sym] = price
+            return results_map
+
+        # 先用批次下載取得初步價格
+        batch_prices = batch_download_prices(symbols, batch_size=40)
+
+        # 2) 逐筆填入價格：先從 batch_prices 取值，若無再呼叫 fetch_price 作為 fallback
+        for item in queue:
+            symbol = item.get("symbol")
+            shares = item.get("shares") or 0
+            region = item.get("region") or "未知"
+
+            price = batch_prices.get(symbol)
+            name = None
+            source = None
+
+            if price is not None:
+                source = "yf_download"
+            else:
+                # 若 batch 沒取到，再用 fetch_price（含重試與備援）
+                info = fetch_price(symbol)
+                price = info.get("price")
+                name = info.get("name")
+                source = info.get("source")
+
+            if price is None:
+                missing.append(symbol)
+                market_value = None
+            else:
+                market_value = price * shares
+                total_value_all += market_value
+
+            results.append({
+                "symbol": symbol,
+                "name": name,
+                "shares": shares,
+                "price": price,
+                "market_value": market_value,
+                "region": region,
+                "source": source
+            })
 
     # 轉成 DataFrame 方便處理
     df = pd.DataFrame(results)
@@ -132,7 +237,7 @@ else:
             mv = row["market_value"]
             reg = row["region"]
             total = region_totals.get(reg, 0.0)
-            if mv is None or total == 0:
+            if pd.isna(mv) or total == 0:
                 return None
             return mv / total * 100.0
 
@@ -159,8 +264,8 @@ else:
                 st.info(f"市場 {region} 無可用持有市值資料，無法繪製餅形圖。")
             else:
                 # 建立顯示用的欄位：代號與市值（數值型）
-                pie_df = plot_df[["symbol", "market_value_filled"]].copy()
-                pie_df = pie_df.rename(columns={"symbol": "代號", "market_value_filled": "持有市值"})
+                pie_df = plot_df[["symbol", "name", "market_value_filled"]].copy()
+                pie_df = pie_df.rename(columns={"symbol": "代號", "name": "股票名稱", "market_value_filled": "持有市值"})
 
                 # --- Altair 互動餅圖（首選） ---
                 try:
@@ -169,49 +274,58 @@ else:
                     chart = alt.Chart(pie_df).mark_arc(innerRadius=40).encode(
                         theta=alt.Theta(field="持有市值", type="quantitative"),
                         color=alt.Color(field="代號", type="nominal", legend=alt.Legend(title="代號")),
-                        tooltip=[alt.Tooltip("代號:N"), alt.Tooltip("持有市值:Q", format=",.2f"), alt.Tooltip("pct:Q", format=".2f")]
+                        tooltip=[alt.Tooltip("代號:N"), alt.Tooltip("股票名稱:N"), alt.Tooltip("持有市值:Q", format=",.2f"), alt.Tooltip("pct:Q", format=".2f")]
                     ).properties(width=350, height=300)
                     st.altair_chart(chart, use_container_width=False)
                 except Exception:
                     # --- Matplotlib 備援餅圖 ---
                     fig, ax = plt.subplots(figsize=(4, 4))
-                    labels = pie_df["代號"].tolist()
+                    labels = pie_df.apply(lambda r: f"{r['代號']} ({r['股票名稱']})" if r['股票名稱'] else r['代號'], axis=1).tolist()
                     sizes = pie_df["持有市值"].tolist()
                     # autopct 顯示百分比，若數量多會自動縮短標籤
                     ax.pie(sizes, labels=labels, autopct=lambda p: f'{p:.2f}%' if p > 0 else '', startangle=90)
                     ax.axis('equal')  # 圓形
                     st.pyplot(fig)
-                    
+
             # 取出該 region 的 rows，並格式化顯示欄位
             df_region = df[df["region"] == region].copy()
 
+            # 若沒有 name 欄位，補空字串
+            if "name" not in df_region.columns:
+                df_region["name"] = ""
+            
             # 建顯示用欄位（中文）
             df_region_display = df_region.copy()
             # 格式化 price 與 market_value 與 pct_of_region
-            df_region_display["price"] = df_region_display["price"].apply(lambda x: f"{x:,.2f}" if x is not None else "N/A")
-            df_region_display["market_value"] = df_region_display["market_value"].apply(lambda x: f"{x:,.2f}" if x is not None else "N/A")
-            df_region_display["pct_of_region"] = df_region_display["pct_of_region"].apply(lambda x: f"{x:.2f}%" if x is not None else "N/A")
+            df_region_display["price"] = df_region_display["price"].apply(lambda x: f"{x:,.2f}" if not pd.isna(x) else "N/A")
+            df_region_display["market_value"] = df_region_display["market_value"].apply(lambda x: f"{x:,.2f}" if not pd.isna(x) else "N/A")
+            df_region_display["pct_of_region"] = df_region_display["pct_of_region"].apply(lambda x: f"{x:.2f}%" if not pd.isna(x) else "N/A")
+
 
             # 重新命名欄位為中文並指定顯示順序
             df_region_display = df_region_display.rename(columns={
                 "symbol": "代號",
+                "name": "股票名稱",
                 "shares": "持股數",
                 "price": "單股價格",
                 "market_value": "持有市值",
                 "pct_of_region": "佔該市場總市值比例",
                 "region": "市場"
-            })[["代號", "持股數", "單股價格", "持有市值", "佔該市場總市值比例"]]
+            })[["代號", "股票名稱", "持股數", "單股價格", "持有市值", "佔該市場總市值比例"]]
 
             # 顯示表格
             st.dataframe(df_region_display, use_container_width=True)
 
             # 提供該市場的下載按鈕（CSV，中文欄位）
             csv_region = df_region.copy()
+            if "name" not in csv_region.columns:
+                csv_region["name"] = ""
             csv_region["price"] = csv_region["price"].apply(lambda x: f"{x:.6f}" if x is not None else "")
             csv_region["market_value"] = csv_region["market_value"].apply(lambda x: f"{x:.6f}" if x is not None else "")
             csv_region["pct_of_region"] = csv_region["pct_of_region"].apply(lambda x: f"{x:.6f}" if x is not None else "")
             csv_region = csv_region.rename(columns={
                 "symbol": "代號",
+                "name": "股票名稱",
                 "shares": "持股數",
                 "price": "單股價格",
                 "market_value": "持有市值",
@@ -247,11 +361,14 @@ else:
         # -------------------------
         # 產生 CSV（中文欄位）
         csv_all = df.copy()
+        if "name" not in csv_all.columns:
+            csv_all["name"] = ""
         csv_all["price"] = csv_all["price"].apply(lambda x: f"{x:.6f}" if x is not None else "")
         csv_all["market_value"] = csv_all["market_value"].apply(lambda x: f"{x:.6f}" if x is not None else "")
         csv_all["pct_of_region"] = csv_all["pct_of_region"].apply(lambda x: f"{x:.6f}" if x is not None else "")
         csv_all = csv_all.rename(columns={
             "symbol": "代號",
+            "name": "股票名稱",
             "shares": "持股數",
             "price": "單股價格",
             "market_value": "持有市值",
