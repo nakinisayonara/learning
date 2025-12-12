@@ -60,72 +60,91 @@ def read_query_queue():
 @st.cache_data(ttl=60)
 def fetch_price(symbol: str):
     """
-    主來源 yfinance，失敗時依序備援 Alpha Vantage。
+    嘗試從 Yahoo Finance 取得即時價格。
+    若即時價取不到，fallback 到最近交易日的收盤價。
     回傳統一格式 dict:
-      {"price": float or None, "previous": float or None, "name": str or None, "source": str}
-    ttl=60 秒快取，避免短時間內重複請求。
+      {
+        "price": float or None,
+        "previous": float or None,
+        "name": str or None,
+        "source": str,        # 資料來源標記
+        "timestamp": str or None  # 數據時間（即時或收盤日期）
+      }
     """
-    def normalize(price, prev, name, source):
-        return {"price": price, "previous": prev, "name": name, "source": source}
+    def normalize(price, prev, name, source, timestamp=None):
+        return {
+            "price": price,
+            "previous": prev,
+            "name": name,
+            "source": source,
+            "timestamp": timestamp
+        }
 
-    # 1) 嘗試 yfinance（含 history fallback）
     try:
         t = yf.Ticker(symbol)
         info = t.info or {}
+
+        # 嘗試即時價
         price = info.get("regularMarketPrice") or info.get("currentPrice")
         prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
         name = info.get("shortName") or info.get("longName")
-        if price is None:
-            hist = t.history(period="2d")
-            if not hist.empty:
-                price = float(hist["Close"].iloc[-1])
-                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+
         if price is not None:
-            return normalize(price, prev, name, "yfinance")
+            # 即時價成功
+            return normalize(price, prev, name, "yfinance_realtime", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        # 若即時價失敗，fallback 到最近收盤價
+        hist = t.history(period="5d")  # 最近五天，避免遇到假日
+        if not hist.empty:
+            price = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+            ts = hist.index[-1].strftime("%Y-%m-%d")  # 收盤日期
+            return normalize(price, prev, name, "yfinance_history", ts)
+
     except Exception:
         pass
 
-    # 2) 重試 yfinance 幾次（短暫退避）
-    for attempt in range(2):
-        try:
-            time.sleep(0.5 * (2 ** attempt))
-            t = yf.Ticker(symbol)
-            info = t.info or {}
-            price = info.get("regularMarketPrice") or info.get("currentPrice")
-            prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-            name = info.get("shortName") or info.get("longName")
-            if price is None:
-                hist = t.history(period="2d")
-                if not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
-                    prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
-            if price is not None:
-                return normalize(price, prev, name, "yfinance_retry")
-        except Exception:
-            continue
+    # 若所有方式皆失敗
+    return normalize(None, None, None, "none", None)
 
-    # 3) 備援來源：Alpha Vantage (GLOBAL_QUOTE)（需設定 ALPHA_VANTAGE_KEY）
-    if ALPHA_VANTAGE_KEY:
-        try:
-            url = "https://www.alphavantage.co/query"
-            params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHA_VANTAGE_KEY}
-            r = requests.get(url, params=params, timeout=8)
-            data = r.json()
-            # 若被限流或回傳錯誤，檢查 Note / Error Message
-            if isinstance(data, dict) and ("Note" in data or "Error Message" in data):
-                return normalize(None, None, None, "alpha_vantage_rate_limited")
-            q = data.get("Global Quote", {}) if isinstance(data, dict) else {}
-            price_str = q.get("05. price") or q.get("05. Price")
-            price = float(price_str) if price_str else None
-            prev = None
-            name = None
-            if price is not None:
-                return normalize(price, prev, name, "alpha_vantage")
-        except Exception:
-            pass
+# -------------------------
+# 股票名稱查詢（交易所資料）
+# -------------------------
+def get_twse_names():
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+    dfs = pd.read_html(url)
+    df = dfs[0]
+    df.columns = df.iloc[0]
+    df = df.drop(0)
+    df = df.rename(columns={"有價證券代號": "symbol", "有價證券名稱": "name"})
+    return dict(zip(df["symbol"], df["name"]))
 
-    # 4) 若所有來源皆失敗，回傳 None
-    return normalize(None, None, None, "none")
+def get_hkex_names():
+    url = "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities?sc_lang=en"
+    dfs = pd.read_html(url)
+    df = dfs[0]
+    df = df.rename(columns={"Stock Code": "symbol", "Name of Securities": "name"})
+    return dict(zip(df["symbol"].astype(str) + ".HK", df["name"]))
+
+# 建立快取字典
+try:
+    twse_map = get_twse_names()
+except Exception:
+    twse_map = {}
+
+try:
+    hkex_map = get_hkex_names()
+except Exception:
+    hkex_map = {}
+
+def lookup_name(symbol):
+    if symbol.endswith(".TW"):
+        return twse_map.get(symbol.replace(".TW", ""), symbol)
+    elif symbol.endswith(".HK"):
+        return hkex_map.get(symbol.replace(".HK", ""), symbol)
+    else:
+        return symbol
+
 
 # -------------------------
 # 主流程：讀取 queue 並逐檔查詢
@@ -149,13 +168,20 @@ else:
         def batch_download_prices(symbols, batch_size=40):
             """
             分批使用 yf.download 取得當日價格，回傳 dict: {symbol: price or None}
-            處理多檔與單檔回傳格式差異，若失敗則該 symbol 對應 None
+            - symbols: 股票代號清單
+            - batch_size: 每批查詢數量，建議 20~50
             """
             results_map = {}
             for i in range(0, len(symbols), batch_size):
                 chunk = symbols[i:i+batch_size]
                 try:
-                    hist = yf.download(tickers=" ".join(chunk), period="1d", group_by="ticker", threads=True, progress=False)
+                    hist = yf.download(
+                        tickers=" ".join(chunk),
+                        period="1d",
+                        group_by="ticker",
+                        threads=True,
+                        progress=False
+                    )
                 except Exception:
                     hist = None
                 for sym in chunk:
@@ -176,6 +202,7 @@ else:
         # 先用批次下載取得初步價格
         batch_prices = batch_download_prices(symbols, batch_size=40)
 
+
         # 2) 逐筆填入價格：先從 batch_prices 取值，若無再呼叫 fetch_price 作為 fallback
         for item in queue:
             symbol = item.get("symbol")
@@ -185,15 +212,19 @@ else:
             price = batch_prices.get(symbol)
             name = None
             source = None
+            timestamp = None   # ← 先準備一個 timestamp 變數
 
             if price is not None:
+                # 批次下載成功 → 標記即時查詢時間
                 source = "yf_download"
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             else:
-                # 若 batch 沒取到，再用 fetch_price（含重試與備援）
+                # 若批次查不到，呼叫 fetch_price（含 fallback）
                 info = fetch_price(symbol)
                 price = info.get("price")
-                name = info.get("name")
+                name = lookup_name(symbol)
                 source = info.get("source")
+                timestamp = info.get("timestamp")  # ← 從 fetch_price 取得時間
 
             if price is None:
                 missing.append(symbol)
@@ -204,13 +235,15 @@ else:
 
             results.append({
                 "symbol": symbol,
-                "name": name,
+                "name": name or symbol,
                 "shares": shares,
                 "price": price,
                 "market_value": market_value,
                 "region": region,
-                "source": source
+                "source": source,
+                "timestamp": timestamp,
             })
+
 
     # 轉成 DataFrame 方便處理
     df = pd.DataFrame(results)
@@ -296,6 +329,14 @@ else:
             
             # 建顯示用欄位（中文）
             df_region_display = df_region.copy()
+
+            # 確保有 timestamp 欄位
+            if "timestamp" not in df_region_display.columns:
+                df_region_display["timestamp"] = "N/A"
+
+            # 顯示數據時間（即時或收盤日期），若沒有則顯示 N/A
+            df_region_display["timestamp"] = df_region_display["timestamp"].apply(lambda x: x if x else "N/A")
+
             # 格式化 price 與 market_value 與 pct_of_region
             df_region_display["price"] = df_region_display["price"].apply(lambda x: f"{x:,.2f}" if not pd.isna(x) else "N/A")
             df_region_display["market_value"] = df_region_display["market_value"].apply(lambda x: f"{x:,.2f}" if not pd.isna(x) else "N/A")
@@ -310,8 +351,9 @@ else:
                 "price": "單股價格",
                 "market_value": "持有市值",
                 "pct_of_region": "佔該市場總市值比例",
-                "region": "市場"
-            })[["代號", "股票名稱", "持股數", "單股價格", "持有市值", "佔該市場總市值比例"]]
+                "region": "市場",
+                "timestamp": "數據時間"
+            })[["代號", "股票名稱", "持股數", "單股價格", "持有市值", "佔該市場總市值比例", "數據時間"]]
 
             # 顯示表格
             st.dataframe(df_region_display, use_container_width=True)
@@ -333,12 +375,15 @@ else:
                 "region": "市場"
             })
             csv_text_region = csv_region.to_csv(index=False, encoding="utf-8-sig")
+            csv_bytes_region = csv_text_region.encode("utf-8-sig")   # 轉成 bytes，避免 Excel 亂碼
+
             st.download_button(
                 label=f"⬇️ 下載 {region} 查詢結果 CSV",
-                data=csv_text_region,
+                data=csv_bytes_region,
                 file_name=f"查詢結果_{region}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
-            )
+)
+
 
             st.markdown("---")
 
@@ -376,9 +421,11 @@ else:
             "region": "市場"
         })
         csv_text_all = csv_all.to_csv(index=False, encoding="utf-8-sig")
+        csv_bytes_all = csv_text_all.encode("utf-8-sig")   # 轉成 bytes
+
         st.download_button(
             label="⬇️ 下載全部查詢結果 CSV（含市場與佔比）",
-            data=csv_text_all,
+            data=csv_bytes_all,
             file_name=f"查詢結果_全部_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv"
         )

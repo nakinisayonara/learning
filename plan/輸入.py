@@ -160,8 +160,13 @@ def add_item():
         st.warning("請輸入股票代號")
         return
 
-    suffix = suffix_map.get(region, "")
-    full_symbol = symbol_raw.upper() + suffix
+    if region == "港股":
+        # 港股代號通常是四位數字，補零到四位再加 .HK
+        full_symbol = symbol_raw.zfill(4) + ".HK"
+    else:
+        suffix = suffix_map.get(region, "")
+        full_symbol = symbol_raw.upper() + suffix
+
 
     exists = any(item["symbol"] == full_symbol for item in st.session_state.portfolio)
     if exists:
@@ -340,7 +345,7 @@ def export_csv():
     buffer.seek(0)
     # 產生檔名
     filename = f"portfolio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return filename, buffer.getvalue()
+    return filename, buffer.getvalue().encode("utf-8-sig")
 
 # ---------- 匯入 CSV ----------
 # 修改：支援 mode 的匯入函式（替換原本的 import_csv）
