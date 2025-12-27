@@ -1,6 +1,6 @@
 streamlit==1.40.0
 yfinance==0.2.44
-akshare==1.11.98
+akshare
 pandas==2.2.3
 numpy==2.1.3
 requests==2.32.3
