@@ -1,5 +1,4 @@
 import streamlit as st
-import sqlite3
 import time
 import io
 import csv
@@ -74,37 +73,12 @@ def safe_rerun():
 st.set_page_config(page_title="股票清單管理", page_icon="📈", layout="wide")
 st.title("股票清單管理（中文介面）")
 
-# SQLite 連線與資料表建立
-conn = sqlite3.connect("portfolio.db", check_same_thread=False)
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS portfolio (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    shares INTEGER NOT NULL,
-    region TEXT NOT NULL
-)
-""")
-conn.commit()
-
 # 啟動時從資料庫載入到 session_state
 # ---------- session_state 初始化（替換或插入） ----------
 if "portfolio" not in st.session_state:
     # 優先使用本機檔案（若存在且非空），否則從 SQLite 載入
     local = load_local_portfolio()
-    if local:
-        st.session_state.portfolio = local
-    else:
-        st.session_state.portfolio = []
-        c.execute("SELECT id, symbol, shares, region FROM portfolio ORDER BY id")
-        rows = c.fetchall()
-        for r in rows:
-            st.session_state.portfolio.append({
-                "id": r[0],
-                "symbol": r[1],
-                "shares": r[2],
-                "region": r[3]
-            })
+    st.session_state.portfolio = local if local else []
 
 # 用來記錄目前正在編輯的項目 id 與暫存編輯值
 if "edit_id" not in st.session_state:
@@ -173,11 +147,8 @@ def add_item():
         st.warning(f"{full_symbol} 已在清單中，若要更新持股請先刪除再重新加入")
         return
 
-    # 寫入 SQLite
-    c.execute("INSERT INTO portfolio (symbol, shares, region) VALUES (?, ?, ?)",
-              (full_symbol, int(new_shares), region))
-    conn.commit()
-    new_id = c.lastrowid
+    # 用時間戳當唯一id
+    new_id = int(time.time() * 1000)
 
     # 同步寫入 session_state
     st.session_state.portfolio.append({
@@ -186,6 +157,7 @@ def add_item():
         "shares": int(new_shares),
         "region": region
     })
+    save_local_portfolio(st.session_state.portfolio)
 
     # 儲存到本機並回饋；成功後再重新整理畫面
     ok = save_local_portfolio(st.session_state.portfolio)
@@ -194,7 +166,7 @@ def add_item():
         safe_rerun()
     else:
         # 已寫入 SQLite，但本機儲存失敗，明確提示使用者後續處理
-        st.warning(f"已添加：{full_symbol}，持股 {new_shares} 股（已寫入資料庫）。")
+        st.warning(f"已添加：{full_symbol}，持股 {new_shares} 股（已添加，但本機儲存失敗）。")
         st.error("儲存到本機失敗，請檢查檔案權限或磁碟空間；若需要可重新嘗試匯出或手動備份。")
 
 if st.button("+ 新增到清單"):
@@ -202,32 +174,12 @@ if st.button("+ 新增到清單"):
 
 st.markdown("---")
 
-# ---------- 新增：把整個清單寫入查詢隊列（放在 app.py，DB 已連線後） ----------
+QUERY_PATH = APP_DIR / "query_queue.json"
+
+# ---------- 新增：把整個清單寫入查詢隊列 ----------
 def push_portfolio_to_query_queue():
-    """
-    將目前 session_state.portfolio 的內容寫入資料庫的 query_queue 表。
-    若表不存在會建立。每次呼叫會先清空舊的 queue，再寫入最新清單。
-    """
-    # 建表（若不存在）
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS query_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        shares INTEGER NOT NULL,
-        region TEXT
-    )
-    """)
-    conn.commit()
-
-    # 清空舊的 queue
-    c.execute("DELETE FROM query_queue")
-    conn.commit()
-
-    # 寫入新的 queue
-    for p in st.session_state.portfolio:
-        c.execute("INSERT INTO query_queue (symbol, shares, region) VALUES (?, ?, ?)",
-                  (p["symbol"], p["shares"], p.get("region", "")))
-    conn.commit()
+    with open(QUERY_PATH, "w", encoding="utf-8") as f:
+        json.dump(st.session_state.portfolio, f, ensure_ascii=False, indent=2)
 
 # 在 UI 放一個按鈕讓使用者把整個清單送去查詢
 if st.button("🔁 將整個清單送去股票查詢"):
@@ -265,8 +217,6 @@ if st.session_state.portfolio:
         with col_c:
             # 刪除按鈕
             if st.button("刪除", key=f"del_{item['id']}"):
-                c.execute("DELETE FROM portfolio WHERE id = ?", (item["id"],))
-                conn.commit()
                 # 更新session_state
                 st.session_state.portfolio = [p for p in st.session_state.portfolio if p["id"] != item["id"]]
 
@@ -293,9 +243,6 @@ if st.session_state.portfolio:
             col_save, col_cancel = st.columns([1, 1])
             with col_save:
                 if st.button("儲存變更", key=f"save_{edit_item['id']}"):
-                    # 更新 SQLite
-                    c.execute("UPDATE portfolio SET shares = ? WHERE id = ?", (int(new_value), edit_item["id"]))
-                    conn.commit()
                     # 更新 session_state
                     for p in st.session_state.portfolio:
                         if p["id"] == edit_item["id"]:
@@ -330,17 +277,13 @@ st.markdown("---")
 
 # ---------- 匯出 CSV ----------
 def export_csv():
-    # 從資料庫讀取最新資料，確保匯出為真實來源
-    c.execute("SELECT id, symbol, shares, region FROM portfolio ORDER BY id")
-    rows = c.fetchall()
-
     # 建立 CSV 內容（使用 in-memory buffer）
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     # 標頭（中文）
     writer.writerow(["編號", "代號", "持股數", "市場"])
-    for r in rows:
-        writer.writerow([r[0], r[1], r[2], r[3]])
+    for p in st.session_state.portfolio:
+        writer.writerow([p["id"], p["symbol"], p["shares"], p["region"]])
 
     buffer.seek(0)
     # 產生檔名
@@ -386,9 +329,7 @@ def import_csv_with_mode(uploaded_file, mode="skip"):
                     skipped += 1
                     continue
                 elif mode == "overwrite":
-                    # 更新 SQLite 與 session_state
-                    c.execute("UPDATE portfolio SET shares = ?, region = ? WHERE id = ?", (shares_int, region, existing["id"]))
-                    conn.commit()
+                    # 更新session_state
                     # 更新 session_state 中的物件
                     for p in st.session_state.portfolio:
                         if p["id"] == existing["id"]:
@@ -398,18 +339,12 @@ def import_csv_with_mode(uploaded_file, mode="skip"):
                     updated += 1
                 elif mode == "append":
                     # 仍然 INSERT（會造成重複）
-                    c.execute("INSERT INTO portfolio (symbol, shares, region) VALUES (?, ?, ?)",
-                              (symbol, shares_int, region))
-                    conn.commit()
-                    new_id = c.lastrowid
+                    new_id = int(time.time() * 1000)
                     st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                     added += 1
             else:
                 # 不存在則新增
-                c.execute("INSERT INTO portfolio (symbol, shares, region) VALUES (?, ?, ?)",
-                          (symbol, shares_int, region))
-                conn.commit()
-                new_id = c.lastrowid
+                new_id = int(time.time() * 1000)
                 st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                 added += 1
 
@@ -428,11 +363,9 @@ def import_csv_with_mode(uploaded_file, mode="skip"):
 
 # ---------- 匯出 JSON ----------
 def export_json():
-    c.execute("SELECT id, symbol, shares, region FROM portfolio ORDER BY id")
-    rows = c.fetchall()
     data = []
-    for r in rows:
-        data.append({"id": r[0], "symbol": r[1], "shares": r[2], "region": r[3]})
+    for p in st.session_state.portfolio:
+        data.append({"id": p["id"], "symbol": p["symbol"], "shares": p["shares"], "region": p["region"]})
     json_text = json.dumps(data, ensure_ascii=False, indent=2)
     filename = f"portfolio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     return filename, json_text
@@ -482,9 +415,7 @@ def import_json_with_mode(uploaded_file, mode="skip"):
                     skipped += 1
                     continue
                 elif mode == "overwrite":
-                    # 更新 SQLite 與 session_state
-                    c.execute("UPDATE portfolio SET shares = ?, region = ? WHERE id = ?", (shares_int, region, existing["id"]))
-                    conn.commit()
+                    # 更新session_state
                     for p in st.session_state.portfolio:
                         if p["id"] == existing["id"]:
                             p["shares"] = shares_int
@@ -492,18 +423,12 @@ def import_json_with_mode(uploaded_file, mode="skip"):
                             break
                     updated += 1
                 elif mode == "append":
-                    c.execute("INSERT INTO portfolio (symbol, shares, region) VALUES (?, ?, ?)",
-                              (symbol, shares_int, region))
-                    conn.commit()
-                    new_id = c.lastrowid
+                    new_id = int(time.time() * 1000)
                     st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                     added += 1
             else:
                 # 新增
-                c.execute("INSERT INTO portfolio (symbol, shares, region) VALUES (?, ?, ?)",
-                          (symbol, shares_int, region))
-                conn.commit()
-                new_id = c.lastrowid
+                new_id = int(time.time() * 1000)
                 st.session_state.portfolio.append({"id": new_id, "symbol": symbol, "shares": shares_int, "region": region})
                 added += 1
 
@@ -694,10 +619,8 @@ if uploaded_json is not None:
 
 # 清空清單與二次確認
 if st.button("清空全部"):
-    st.warning("⚠️ 確認要刪除資料庫中所有項目？此操作無法復原。")
+    st.warning("⚠️ 確認要刪除本機記錄？此操作無法復原。")
     if st.button("確認清空"):
-        c.execute("DELETE FROM portfolio")
-        conn.commit()
         st.session_state.portfolio = []
 
         ok = save_local_portfolio(st.session_state.portfolio)

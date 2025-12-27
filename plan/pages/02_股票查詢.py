@@ -10,16 +10,60 @@
 #    pip install streamlit yfinance pandas
 
 import streamlit as st
-import sqlite3
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
 import altair as alt
 import matplotlib.pyplot as plt
 import os
+import json
 import time
 import requests
 import math
+from pathlib import Path
+import akshare as ak # 開源 Python 庫，支援港股、美股、A股等行情，無需 API Key
+
+# 把 symbols.json 放在和程式同一個資料夾 
+SYMBOLS_PATH = Path(__file__).parent / "symbols.json"
+
+# -------------------------
+# 快取檔案：同時存名稱、最後成功價格、時間戳
+# -------------------------
+def load_symbols():
+    """讀取本地快取檔案，支援舊格式（只有名稱），並擴充為同時存價格與時間戳"""
+    if SYMBOLS_PATH.exists():
+        try:
+            text = SYMBOLS_PATH.read_text(encoding="utf-8")
+            data = json.loads(text)
+            cache = {}
+            for item in data:
+                if isinstance(item, dict):
+                    cache[item["symbol"]] = {
+                        "name": item.get("name"),
+                        "last_price": item.get("last_price"),
+                        "last_timestamp": item.get("last_timestamp")
+                    }
+            return cache
+        except Exception:
+            return {}
+    return {}
+
+def save_symbols(symbols_dict):
+    """寫回本地快取檔案，包含名稱、最後成功價格、時間戳"""
+    data = []
+    for s, v in symbols_dict.items():
+        data.append({
+            "symbol": s,
+            "name": v.get("name"),
+            "last_price": v.get("last_price"),
+            "last_timestamp": v.get("last_timestamp")
+        })
+    SYMBOLS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# 初始化快取字典
+symbols_cache = load_symbols()
+
+
 
 
 # 讀取備援 API key（若使用 Alpha Vantage 或其他）
@@ -32,45 +76,46 @@ st.set_page_config(page_title="股票查詢", page_icon="🔎", layout="wide")
 st.title("🔎 股票查詢與持有市值（依市場分表）")
 
 # -------------------------
-# 與 app.py 共用的資料庫連線
-# -------------------------
-# 假設 app.py 與此檔案共用同一個 SQLite 檔案（例如 portfolio.db）
-conn = sqlite3.connect("portfolio.db", check_same_thread=False)
-c = conn.cursor()
-
-# -------------------------
 # 讀取查詢隊列（query_queue）
 # -------------------------
+from pathlib import Path
+
+QUERY_PATH = Path.home() / ".my_stock_app" / "query_queue.json"
+
 def read_query_queue():
     """
-    從 query_queue 表讀取要查詢的清單。
-    若表不存在或為空，回傳空 list。
+    從 query_queue.json 讀取要查詢的清單。
+    若檔案不存在或解析失敗，回傳空 list。
     每筆為 dict: {"symbol":..., "shares":..., "region":...}
     """
     try:
-        c.execute("SELECT symbol, shares, region FROM query_queue ORDER BY id")
-        rows = c.fetchall()
-        return [{"symbol": r[0], "shares": r[1], "region": r[2] or ""} for r in rows]
+        if QUERY_PATH.exists():
+            text = QUERY_PATH.read_text(encoding="utf-8")
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
     except Exception:
-        return []
+        pass
+    return []
 
 # -------------------------
 # 抓取單檔價格（快取）
+# -------------------------
+# -------------------------
+# 抓取單檔價格（強化版，三層 fallback）
 # -------------------------
 @st.cache_data(ttl=60)
 def fetch_price(symbol: str):
     """
     嘗試從 Yahoo Finance 取得即時價格。
-    若即時價取不到，fallback 到最近交易日的收盤價。
-    回傳統一格式 dict:
-      {
-        "price": float or None,
-        "previous": float or None,
-        "name": str or None,
-        "source": str,        # 資料來源標記
-        "timestamp": str or None  # 數據時間（即時或收盤日期）
-      }
+    四層 fallback：
+      1. 即時價 (regularMarketPrice)
+      2. 最近 5 天收盤價 (history)
+      3. 最近 1 個月收盤價 (history)
+      4. AkShare 港股日線行情（僅限港股）
+      5. 快取最後成功價格
     """
+
     def normalize(price, prev, name, source, timestamp=None):
         return {
             "price": price,
@@ -81,31 +126,96 @@ def fetch_price(symbol: str):
         }
 
     try:
+        # ---------------- [修改位置 1] 嘗試即時價 ----------------
         t = yf.Ticker(symbol)
         info = t.info or {}
 
-        # 嘗試即時價
         price = info.get("regularMarketPrice") or info.get("currentPrice")
         prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
         name = info.get("shortName") or info.get("longName")
 
         if price is not None:
-            # 即時價成功
+            # 即時價成功 → 更新快取
+            symbols_cache[symbol] = {
+                "name": name,
+                "last_price": price,
+                "last_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            save_symbols(symbols_cache)
             return normalize(price, prev, name, "yfinance_realtime", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        # 若即時價失敗，fallback 到最近收盤價
-        hist = t.history(period="5d")  # 最近五天，避免遇到假日
+        # ---------------- [修改位置 2] fallback → 最近 5 天收盤價 ----------------
+        hist = t.history(period="5d")
         if not hist.empty:
             price = float(hist["Close"].iloc[-1])
             prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
-            ts = hist.index[-1].strftime("%Y-%m-%d")  # 收盤日期
+            ts = hist.index[-1].strftime("%Y-%m-%d")
+            # 更新快取
+            symbols_cache[symbol] = {
+                "name": name,
+                "last_price": price,
+                "last_timestamp": ts
+            }
+            save_symbols(symbols_cache)
             return normalize(price, prev, name, "yfinance_history", ts)
+
+        # ---------------- [修改位置 2b] 若 5 天失敗，再試 1 個月收盤價 ----------------
+        if hist.empty:
+            try:
+                hist = t.history(period="1mo")
+                if not hist.empty:
+                    price = float(hist["Close"].iloc[-1])
+                    prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
+                    ts = hist.index[-1].strftime("%Y-%m-%d")
+                    symbols_cache[symbol] = {
+                        "name": name,
+                        "last_price": price,
+                        "last_timestamp": ts
+                    }
+                    save_symbols(symbols_cache)
+                    return normalize(price, prev, name, "yfinance_history_1mo", ts)
+            except Exception:
+                pass
 
     except Exception:
         pass
 
+    # ---------------- [修改位置 B] 使用 AkShare 日線行情作為港股後備 ----------------
+    try:
+        if symbol.endswith(".HK"):
+            # AkShare 港股日線需要五位數字代碼（例如 00005）
+            code = symbol.replace(".HK", "").zfill(5)
+            df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+            if not df.empty:
+                price = float(df["close"].iloc[-1])   # 最近收盤價
+                ts = df.index[-1].strftime("%Y-%m-%d")  # 最近交易日
+                name = symbol  # 暫時用代號當名稱，或可再查 hkex_map
+                # 更新快取
+                symbols_cache[symbol] = {
+                    "name": name,
+                    "last_price": price,
+                    "last_timestamp": ts
+                }
+                save_symbols(symbols_cache)
+                return normalize(price, None, name, "akshare_hk_daily", ts)
+    except Exception:
+        pass
+    # ------------------------------------------------------------
+
+    # ---------------- [修改位置 3] 最後 fallback → 使用快取最後成功價格 ----------------
+    if symbol in symbols_cache and symbols_cache[symbol].get("last_price"):
+        cached = symbols_cache[symbol]
+        return normalize(
+            cached.get("last_price"),
+            None,
+            cached.get("name"),
+            "cache_fallback",
+            cached.get("last_timestamp")
+        )
+
     # 若所有方式皆失敗
     return normalize(None, None, None, "none", None)
+
 
 # -------------------------
 # 股票名稱查詢（交易所資料）
@@ -126,6 +236,32 @@ def get_hkex_names():
     df = df.rename(columns={"Stock Code": "symbol", "Name of Securities": "name"})
     return dict(zip(df["symbol"].astype(str) + ".HK", df["name"]))
 
+def get_us_names():
+    """
+    從 NASDAQ 與 NYSE 的股票清單抓取代號與公司名稱。
+    這裡示範使用 stockanalysis.com 提供的清單（包含 NASDAQ/NYSE）。
+    注意：這些網站可能會更新格式，若失敗則回傳空字典。
+    """
+    try:
+        # NASDAQ 股票清單
+        nasdaq_url = "https://stockanalysis.com/list/nasdaq-stocks/"
+        dfs_nasdaq = pd.read_html(nasdaq_url)
+        df_nasdaq = dfs_nasdaq[0]
+        nasdaq_map = dict(zip(df_nasdaq["Symbol"], df_nasdaq["Company Name"]))
+
+        # NYSE 股票清單
+        nyse_url = "https://stockanalysis.com/list/nyse-stocks/"
+        dfs_nyse = pd.read_html(nyse_url)
+        df_nyse = dfs_nyse[0]
+        nyse_map = dict(zip(df_nyse["Symbol"], df_nyse["Company Name"]))
+
+        # 合併兩個字典
+        return {**nasdaq_map, **nyse_map}
+    except Exception:
+        # 若抓取失敗，回傳空字典
+        return {}
+
+
 # 建立快取字典
 try:
     twse_map = get_twse_names()
@@ -137,13 +273,54 @@ try:
 except Exception:
     hkex_map = {}
 
+try:
+    us_map = get_us_names()
+except Exception:
+    us_map = {}
+
+
 def lookup_name(symbol):
-    if symbol.endswith(".TW"):
-        return twse_map.get(symbol.replace(".TW", ""), symbol)
-    elif symbol.endswith(".HK"):
-        return hkex_map.get(symbol.replace(".HK", ""), symbol)
+    """
+    查股票名稱：
+    優先使用 yfinance → 若失敗直接用代號。
+    （港股不再使用 hkex_map，避免名稱不一致）
+    """
+
+    # 如果快取已有名稱，直接回傳
+    if symbol in symbols_cache and symbols_cache[symbol].get("name"):
+        return symbols_cache[symbol]["name"]
+
+    name = None
+
+    # 優先嘗試 yfinance
+    try:
+        t = yf.Ticker(symbol)
+        name = t.info.get("longName") or t.info.get("shortName")
+    except Exception:
+        name = None
+
+    # 港股：不再使用 hkex_map，若 yfinance 沒有就直接用代號
+    if not name and symbol.endswith(".HK"):
+        name = symbol
+
+    # 台股、美股：仍可用各自清單補充
+    if not name and symbol.endswith(".TW"):
+        name = twse_map.get(symbol.replace(".TW", ""), None)
+    elif not name and symbol.isalpha():
+        name = us_map.get(symbol, None)
+
+    # 最後 fallback → 用代號本身
+    if not name:
+        name = symbol
+
+    # 更新快取（保留 last_price 不變）
+    if symbol in symbols_cache:
+        symbols_cache[symbol]["name"] = name
     else:
-        return symbol
+        symbols_cache[symbol] = {"name": name, "last_price": None, "last_timestamp": None}
+    save_symbols(symbols_cache)
+
+    return name
 
 
 # -------------------------
@@ -151,10 +328,22 @@ def lookup_name(symbol):
 # -------------------------
 queue = read_query_queue()
 
+# ---------------- [修改位置 A] 初始化 session_state ----------------
+# 用來記錄需要重新抓取的地區，預設為 None
+if "refresh_region" not in st.session_state:
+    st.session_state["refresh_region"] = None
+# ------------------------------------------------------------
+
 if not queue:
-    st.info("查詢隊列為空。請在主頁（app.py）按「將整個清單送去股票查詢」後再回到此頁。")
+    st.info("查詢隊列為空。請在主頁（app.py）按「將整個清單送去股票查詢」後再回到此頁。清單會存到本機 query_queue.json。")
 else:
     st.markdown(f"**查詢時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}**")
+
+    # ---------------- 新增「全部重新抓取」按鈕 ---------------- 
+    if st.button("🔄 全部重新抓取數據"): 
+        # 使用 Streamlit 提供的 rerun 方法，整個頁面重新執行 
+        st.rerun()
+    # ------------------------------------------------------------
 
     # 建議把查詢主體包在 spinner 中，並嘗試先用批次抓價再 fallback
     with st.spinner("正在查詢價格，請稍候..."):
@@ -184,6 +373,7 @@ else:
                     )
                 except Exception:
                     hist = None
+
                 for sym in chunk:
                     price = None
                     if hist is not None:
@@ -196,8 +386,30 @@ else:
                                 price = float(hist["Close"].iloc[-1])
                         except Exception:
                             price = None
+
+                    # ---------------- [修改位置] 新增單檔 fallback ----------------
+                    # 如果批次下載失敗，嘗試單獨下載最近 5 天收盤價
+                    if price is None:
+                        try:
+                            single_hist = yf.download(sym, period="5d")
+                            if not single_hist.empty:
+                                price = float(single_hist["Close"].iloc[-1])
+                        except Exception:
+                            price = None
+                    # ------------------------------------------------------------
+                    # ---------------- [修改位置 D] 若 5 天失敗，再試 1 個月收盤價 ----------------
+                        if price is None:
+                            try:
+                                single_hist = yf.download(sym, period="1mo")
+                                if not single_hist.empty:
+                                    price = float(single_hist["Close"].iloc[-1])
+                            except Exception:
+                                price = None
+
+
                     results_map[sym] = price
             return results_map
+
 
         # 先用批次下載取得初步價格
         batch_prices = batch_download_prices(symbols, batch_size=40)
@@ -214,17 +426,22 @@ else:
             source = None
             timestamp = None   # ← 先準備一個 timestamp 變數
 
-            if price is not None:
-                # 批次下載成功 → 標記即時查詢時間
-                source = "yf_download"
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ---------------- [修改位置 C] 判斷是否只更新某地區 ----------------
+            if price is not None and st.session_state["refresh_region"] != region:
+                # 如果不是指定要更新的地區，就直接用批次結果或快取
+                source = "cache_or_download"
+                timestamp = symbols_cache.get(symbol, {}).get("last_timestamp") or "N/A"
+                name = lookup_name(symbol)
             else:
-                # 若批次查不到，呼叫 fetch_price（含 fallback）
+                # 若是指定要更新的地區，或批次查不到 → 呼叫 fetch_price
                 info = fetch_price(symbol)
                 price = info.get("price")
-                name = lookup_name(symbol)
+                name = lookup_name(symbol) or info.get("name") or symbol
                 source = info.get("source")
-                timestamp = info.get("timestamp")  # ← 從 fetch_price 取得時間
+                timestamp = info.get("timestamp")
+            # ------------------------------------------------------------
+
+
 
             if price is None:
                 missing.append(symbol)
@@ -357,6 +574,16 @@ else:
 
             # 顯示表格
             st.dataframe(df_region_display, use_container_width=True)
+
+            # ---------------- [修改位置 B] 分區重新抓取邏輯 ----------------
+            if st.button(f"🔄 重新抓取 {region} 數據"):
+                # 記錄需要更新的地區
+                st.session_state["refresh_region"] = region
+                # 重新執行一次，並保留 refresh_region 狀態
+                st.rerun()
+            # ------------------------------------------------------------
+
+
 
             # 提供該市場的下載按鈕（CSV，中文欄位）
             csv_region = df_region.copy()
