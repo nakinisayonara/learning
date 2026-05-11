@@ -1,18 +1,25 @@
 import streamlit as st
 import joblib
 import pandas as pd
+import os
 
 # 0. 網頁基本設定 (放在最前面)
-st.set_page_config(page_title="資安 AI 實驗室", page_icon="🛡️")
-
-# 1. 載入我們「冷凍」的模型和特徵清單
-# 使用 cache_resource 是為了避免每次重新整理網頁都要重新讀取檔案，提高效能
 @st.cache_resource
 def load_model():
-    model = joblib.load('phishing_rf_model.pkl')
-    features = joblib.load('feature_names.pkl')
+    # 1. 獲取當前 app.py 檔案所在的資料夾路徑
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 2. 拼接出模型與特徵清單的完整絕對路徑
+    model_path = os.path.join(current_dir, 'phishing_rf_model.pkl')
+    features_path = os.path.join(current_dir, 'feature_names.pkl')
+    
+    # 3. 使用完整路徑載入檔案
+    model = joblib.load(model_path)
+    features = joblib.load(features_path)
+    
     return model, features
 
+# 執行載入
 model, feature_names = load_model()
 
 # --- 側邊欄 (Sidebar) ---
